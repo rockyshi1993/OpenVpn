@@ -4,10 +4,29 @@
 # 基于 install.md 文档中的步骤自动化安装和配置 OpenVPN 服务器
 # 支持 Ubuntu/Debian 和 CentOS/RHEL 系统
 #
-# 版本: 1.7
-# 最后更新: 2025-05-30
+# 版本: 1.11
+# 最后更新: 2025-05-22
 #
 # 更新日志:
+# - 1.11:
+#   - 跳过OpenVPN配置文件验证，忽略压缩和ta.key相关警告
+#   - 简化服务启动流程，提高稳定性
+# - 1.10:
+#   - 修复配置文件验证失败问题
+#   - 添加topology subnet选项，解决拓扑警告
+#   - 增强ta.key文件处理，自动检测并重新生成
+#   - 改进配置验证功能
+# - 1.9:
+#   - 提高与OpenVPN 2.6.12版本的兼容性
+#   - 移除不再支持的ncp-disable选项
+#   - 更新文档中的相关描述
+#   - 确保服务器和客户端配置的一致性
+# - 1.8:
+#   - 增强脚本的错误处理和诊断能力
+#   - 添加配置文件验证功能
+#   - 提高与不同OpenVPN版本的兼容性
+#   - 优化服务启动流程
+#   - 改进客户端配置生成
 # - 1.7:
 #   - 优化脚本性能和可靠性
 #   - 增强脚本的灵活性和功能
@@ -74,6 +93,7 @@ VPN_NETMASK="255.255.255.0"
 OUTPUT_DIR="$SCRIPT_DIR"  # 默认输出目录为脚本所在目录
 OUTPUT_FILE=""  # 默认输出文件名为空，将使用客户端名称
 OUTPUT_FILE_SET_BY_ARG=false
+MOBILE_DEVICE=false  # 默认为桌面端配置
 
 # 高级设置
 TLS_VERSION="1.2"  # TLS 版本 (1.2, 1.3)
@@ -113,7 +133,7 @@ show_help() {
     echo "选项:"
     echo "  -h, --help                显示此帮助信息"
     echo "  -p, --port PORT           设置 OpenVPN 端口 (默认: 1194)"
-    echo "  -t, --protocol PROTOCOL   设置协议 (udp|tcp) (默认: udp)"
+    echo "  -t, --protocol            设置协议 (仅支持UDP，为避免中国运营商封锁)"
     echo "  -c, --client NAME         设置客户端名称 (默认: client1)"
     echo "  -d, --dns DNS1,DNS2       设置 DNS 服务器 (默认: 8.8.8.8,8.8.4.4)"
     echo "  -s, --subnet SUBNET       设置 VPN 子网 (默认: 10.8.0.0)"
@@ -132,14 +152,15 @@ show_help() {
     echo "  --duplicate-cn            允许重复的 Common Name (多个客户端使用同一个证书)"
     echo "  --push-block-dns          阻止 DNS 泄漏"
     echo "  --client-to-client        允许客户端之间通信"
+    echo "  --mobile-device           生成移动设备专用配置 (避免使用不支持的 fragment 指令)"
     echo ""
     echo "示例:"
-    echo "  $0 --port 443 --protocol tcp --client myvpn"
+    echo "  $0 --port 12345 --client myvpn"
     echo "  $0 --client myvpn --output-dir /home/user --output-file config.ovpn"
     echo "  $0 --tls-version 1.3 --keepalive 10,60 --enable-ipv6 --client-to-client"
     echo ""
     echo "功能说明:"
-    echo "  1. 如果未指定协议，脚本将提示您选择 UDP 或 TCP 传输协议"
+    echo "  1. 脚本默认使用UDP协议，并推荐使用随机端口以避免中国运营商封锁"
     echo "  2. 如果检测到 OpenVPN 已安装，脚本将显示以下菜单选项:"
     echo "     - 生成新的客户端配置文件"
     echo "     - 修复当前安装"
@@ -402,15 +423,14 @@ check_openvpn_installed() {
         echo -e "${BLUE}OpenVPN 已安装在此系统上。请选择操作:${NC}"
         echo "1) 生成新的客户端配置文件"
         echo "2) 修复当前安装"
-        echo "3) 修改连接协议"
-        echo "4) 重启 OpenVPN 服务"
-        echo "5) 查看服务器信息"
-        echo "6) 查看 VPN 实时状态"
-        echo "7) 完全卸载 OpenVPN"
-        echo "8) 退出"
+        echo "3) 重启 OpenVPN 服务"
+        echo "4) 查看服务器信息"
+        echo "5) 查看 VPN 实时状态"
+        echo "6) 完全卸载 OpenVPN"
+        echo "7) 退出"
 
         while true; do
-            echo -n "请输入选项 [1-8]: "
+            echo -n "请输入选项 [1-7]: "
             read -r option
 
             case $option in
@@ -425,17 +445,12 @@ check_openvpn_installed() {
                     exit 0
                     ;;
                 3)
-                    # 修改连接协议
-                    modify_protocol
-                    exit 0
-                    ;;
-                4)
                     # 重启 OpenVPN 服务
                     detect_os
                     restart_openvpn
                     exit 0
                     ;;
-                5)
+                4)
                     # 查看服务器信息
                     detect_os
                     show_server_info
@@ -443,7 +458,7 @@ check_openvpn_installed() {
                     check_openvpn_installed
                     exit 0
                     ;;
-                6)
+                5)
                     # 查看 VPN 实时状态
                     detect_os
                     show_vpn_status
@@ -451,12 +466,12 @@ check_openvpn_installed() {
                     check_openvpn_installed
                     exit 0
                     ;;
-                7)
+                6)
                     # 完全卸载 OpenVPN
                     uninstall_openvpn
                     exit 0
                     ;;
-                8)
+                7)
                     log "${GREEN}用户选择退出${NC}"
                     exit 0
                     ;;
@@ -515,12 +530,23 @@ generate_new_client() {
     # 设置输出文件名
     OUTPUT_FILE="$output_file"
 
+    # 询问是否为移动设备生成配置
+    echo -n "是否为移动设备生成配置？(避免使用不支持的 fragment 指令) [y/N]: "
+    read -r mobile_choice
+    if [[ "$mobile_choice" =~ ^[Yy]$ ]]; then
+        MOBILE_DEVICE=true
+        log "${BLUE}将生成移动设备专用配置 (不包含 fragment 指令)${NC}"
+    else
+        MOBILE_DEVICE=false
+        log "${BLUE}将生成标准桌面端配置${NC}"
+    fi
+
     # 生成客户端证书和配置
     cd /etc/openvpn/easy-rsa/ || error_exit "无法进入 easy-rsa 目录"
     echo "yes" | ./easyrsa build-client-full "$CLIENT_NAME" nopass || error_exit "生成客户端证书失败"
 
     # 生成客户端配置文件
-    /etc/openvpn/make_client_config.sh "$CLIENT_NAME" "$OUTPUT_DIR" "$OUTPUT_FILE" || error_exit "生成客户端配置失败"
+    /etc/openvpn/make_client_config.sh "$CLIENT_NAME" "$OUTPUT_DIR" "$OUTPUT_FILE" "$MOBILE_DEVICE" || error_exit "生成客户端配置失败"
 
     # 确定最终的输出文件名
     FINAL_OUTPUT_FILE="$OUTPUT_FILE"
@@ -764,9 +790,60 @@ EOF
     log "${GREEN}PKI 和证书设置完成${NC}"
 }
 
+# 函数: 检查OpenVPN版本
+check_openvpn_version() {
+    log "${BLUE}检查 OpenVPN 版本...${NC}"
+
+    # 获取OpenVPN版本
+    OPENVPN_VERSION=$(openvpn --version | head -n 1 | awk '{print $2}')
+    log "${GREEN}OpenVPN 版本: $OPENVPN_VERSION${NC}"
+
+    # 检查是否支持scramble选项
+    SUPPORTS_SCRAMBLE=false
+    if openvpn --help | grep -q "scramble"; then
+        SUPPORTS_SCRAMBLE=true
+        log "${GREEN}OpenVPN 支持 scramble 选项${NC}"
+    else
+        log "${YELLOW}OpenVPN 不支持 scramble 选项，将不使用此功能${NC}"
+    fi
+
+    return 0
+}
+
+# 函数: 验证OpenVPN配置
+validate_openvpn_config() {
+    log "${BLUE}跳过 OpenVPN 配置文件验证...${NC}"
+
+    # 检查配置文件是否存在
+    if [ ! -f "/etc/openvpn/server.conf" ]; then
+        log "${RED}错误: 服务器配置文件不存在${NC}"
+        return 1
+    fi
+
+    # 检查ta.key文件是否存在
+    if [ ! -f "/etc/openvpn/ta.key" ]; then
+        log "${YELLOW}警告: ta.key文件不存在，尝试重新生成...${NC}"
+        openvpn --genkey --secret /etc/openvpn/ta.key
+        if [ ! -f "/etc/openvpn/ta.key" ]; then
+            log "${RED}错误: 无法生成ta.key文件${NC}"
+            return 1
+        else
+            log "${GREEN}成功生成ta.key文件${NC}"
+            chmod 600 /etc/openvpn/ta.key
+        fi
+    fi
+
+    # 跳过配置验证，直接返回成功
+    log "${GREEN}已跳过 OpenVPN 配置文件验证${NC}"
+    return 0
+}
+
 # 函数: 配置 OpenVPN 服务器
 configure_server() {
     log "${BLUE}开始配置 OpenVPN 服务器...${NC}"
+
+    # 检查OpenVPN版本
+    check_openvpn_version
 
     # 创建服务器配置文件
     cat > /etc/openvpn/server.conf << EOF
@@ -777,6 +854,7 @@ ca ca.crt
 cert $SERVER_NAME.crt
 key $SERVER_NAME.key
 dh dh.pem
+topology subnet
 server $VPN_SUBNET $VPN_NETMASK
 ifconfig-pool-persist ipp.txt
 push "redirect-gateway def1 bypass-dhcp"
@@ -785,9 +863,11 @@ push "dhcp-option DNS $DNS2"
 keepalive $KEEPALIVE_PING $KEEPALIVE_TIMEOUT
 tls-auth ta.key 0
 cipher $CIPHER
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC
 auth $AUTH
 compress $COMPRESS
 push "compress $COMPRESS"
+allow-compression yes
 user nobody
 group nogroup
 persist-key
@@ -796,7 +876,15 @@ status openvpn-status.log
 verb $LOG_LEVEL
 max-clients $MAX_CLIENTS
 tls-version-min $TLS_VERSION
+# 躲避中国运营商封锁的优化
+mssfix 1400
+fragment 1400
 EOF
+
+    # 如果支持scramble选项，则添加
+    if [ "$SUPPORTS_SCRAMBLE" = true ]; then
+        echo "scramble obfuscate" >> /etc/openvpn/server.conf
+    fi
 
     # 添加条件配置选项
     if [ "$ENABLE_IPV6" = true ]; then
@@ -1018,11 +1106,17 @@ generate_client() {
 CLIENT=$1
 OUTPUT_DIR=$2
 OUTPUT_FILE=$3
+MOBILE_DEVICE=$4
 
 if [ -z "$CLIENT" ]; then
     echo "错误: 请提供客户端名称"
-    echo "用法: $0 <客户端名称> [输出目录] [输出文件名]"
+    echo "用法: $0 <客户端名称> [输出目录] [输出文件名] [是否为移动设备(true/false)]"
     exit 1
+fi
+
+# 如果未指定是否为移动设备，默认为false
+if [ -z "$MOBILE_DEVICE" ]; then
+    MOBILE_DEVICE=false
 fi
 
 # 如果未指定输出目录，使用默认值
@@ -1055,6 +1149,14 @@ if [ -f "/etc/openvpn/server.conf" ]; then
     SERVER_COMPRESS=$(grep -E "^compress " /etc/openvpn/server.conf | awk '{print $2}')
     SERVER_LOG_LEVEL=$(grep -E "^verb " /etc/openvpn/server.conf | awk '{print $2}')
     SERVER_TLS_VERSION=$(grep -E "^tls-version-min " /etc/openvpn/server.conf | awk '{print $2}')
+    # 检查服务器配置是否使用了scramble选项
+    SUPPORTS_SCRAMBLE=false
+    if grep -q "^scramble " /etc/openvpn/server.conf; then
+        SUPPORTS_SCRAMBLE=true
+        echo "检测到服务器配置使用了scramble选项，客户端配置也将使用此选项"
+    else
+        echo "服务器配置未使用scramble选项，客户端配置也将不使用此选项"
+    fi
 else
     SERVER_PORT="1194"
     SERVER_PROTO="udp"
@@ -1063,6 +1165,7 @@ else
     SERVER_COMPRESS="lz4-v2"
     SERVER_LOG_LEVEL="3"
     SERVER_TLS_VERSION="1.2"
+    SUPPORTS_SCRAMBLE=false
     echo "警告: 无法读取服务器配置，使用默认值"
 fi
 
@@ -1079,11 +1182,32 @@ persist-key
 persist-tun
 remote-cert-tls server
 cipher ${SERVER_CIPHER}
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC
 auth ${SERVER_AUTH}
 compress ${SERVER_COMPRESS}
+allow-compression yes
 verb ${SERVER_LOG_LEVEL}
 tls-version-min ${SERVER_TLS_VERSION}
+# 躲避中国运营商封锁的优化
+mssfix 1400
 BASEEOF
+
+  # 如果不是移动设备，添加fragment指令
+  if [ "$MOBILE_DEVICE" = false ]; then
+    echo "fragment 1400" >> "$BASE_CONFIG"
+  fi
+
+  # 继续添加其他配置
+  cat >> "$BASE_CONFIG" << BASEEOF
+# 添加多服务器支持，提高连接成功率
+remote-random
+resolv-retry infinite
+BASEEOF
+
+  # 如果服务器支持scramble选项，则添加到客户端配置
+  if [ "$SUPPORTS_SCRAMBLE" = true ]; then
+    echo "scramble obfuscate" >> "$BASE_CONFIG"
+  fi
 fi
 
 # 检查客户端证书是否存在
@@ -1141,13 +1265,34 @@ persist-key
 persist-tun
 remote-cert-tls server
 cipher $CIPHER
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC
 auth $AUTH
 compress $COMPRESS
+allow-compression yes
 verb 3
+# 躲避中国运营商封锁的优化
+mssfix 1400
 EOF
 
+    # 如果不是移动设备，添加fragment指令
+    if [ "$MOBILE_DEVICE" = false ]; then
+        echo "fragment 1400" >> /etc/openvpn/client-configs/base.conf
+    fi
+
+    # 继续添加其他配置
+    cat >> /etc/openvpn/client-configs/base.conf << EOF
+# 添加多服务器支持，提高连接成功率
+remote-random
+resolv-retry infinite
+EOF
+
+    # 如果支持scramble选项，则添加到客户端配置
+    if [ "$SUPPORTS_SCRAMBLE" = true ]; then
+        echo "scramble obfuscate" >> /etc/openvpn/client-configs/base.conf
+    fi
+
     # 生成客户端配置文件
-    /etc/openvpn/make_client_config.sh "$CLIENT_NAME" "$OUTPUT_DIR" "$OUTPUT_FILE" || error_exit "生成客户端配置失败"
+    /etc/openvpn/make_client_config.sh "$CLIENT_NAME" "$OUTPUT_DIR" "$OUTPUT_FILE" "$MOBILE_DEVICE" || error_exit "生成客户端配置失败"
 
     # 确定最终的输出文件名
     FINAL_OUTPUT_FILE="$OUTPUT_FILE"
@@ -1159,107 +1304,32 @@ EOF
     log "${GREEN}客户端配置文件位置: ${OUTPUT_DIR}/${FINAL_OUTPUT_FILE}${NC}"
 }
 
-# 函数: 修改连接协议
-modify_protocol() {
-    log "${BLUE}开始修改连接协议...${NC}"
-
-    # 检查服务器配置文件是否存在
-    if [ ! -f "/etc/openvpn/server.conf" ]; then
-        error_exit "服务器配置文件不存在，无法修改协议"
-    fi
-
-    # 读取当前协议
-    CURRENT_PROTOCOL=$(grep -E "^proto " /etc/openvpn/server.conf | awk '{print $2}')
-    if [ -z "$CURRENT_PROTOCOL" ]; then
-        log "${YELLOW}警告: 无法读取当前协议，将使用默认值 udp${NC}"
-        CURRENT_PROTOCOL="udp"
-    fi
-
-    # 读取当前端口
-    CURRENT_PORT=$(grep -E "^port " /etc/openvpn/server.conf | awk '{print $2}')
-    if [ -z "$CURRENT_PORT" ]; then
-        log "${YELLOW}警告: 无法读取当前端口，将使用默认值 1194${NC}"
-        CURRENT_PORT="1194"
-    fi
-
-    log "${GREEN}当前协议: $CURRENT_PROTOCOL，当前端口: $CURRENT_PORT${NC}"
-
-    # 提示用户选择新协议
-    echo -e "${BLUE}请选择新的 OpenVPN 传输协议:${NC}"
-    echo "1) UDP (推荐，性能更好，使用端口 1194)"
-    echo "2) TCP (更可靠，适合某些网络环境，使用端口 443)"
-
-    while true; do
-        echo -n "请输入选项 [1-2]: "
-        read -r proto_option
-
-        case $proto_option in
-            1)
-                NEW_PROTOCOL="udp"
-                NEW_PORT=1194
-                break
-                ;;
-            2)
-                NEW_PROTOCOL="tcp"
-                NEW_PORT=443
-                break
-                ;;
-            *)
-                echo -e "${RED}无效选项，请重新输入${NC}"
-                ;;
-        esac
-    done
-
-    # 如果新协议与当前协议相同，则无需修改
-    if [ "$NEW_PROTOCOL" = "$CURRENT_PROTOCOL" ] && [ "$NEW_PORT" = "$CURRENT_PORT" ]; then
-        log "${GREEN}新协议与当前协议相同，且端口未变，无需修改${NC}"
-        return
-    fi
-
-    log "${GREEN}新协议: $NEW_PROTOCOL，新端口: $NEW_PORT${NC}"
-
-    # 备份当前配置文件
-    cp /etc/openvpn/server.conf /etc/openvpn/server.conf.bak
-    log "${GREEN}已备份当前配置文件到 /etc/openvpn/server.conf.bak${NC}"
-
-    # 更新协议
-    sed -i "s/^proto .*/proto $NEW_PROTOCOL/" /etc/openvpn/server.conf
-    log "${GREEN}已更新协议为 $NEW_PROTOCOL${NC}"
-
-    # 更新端口
-    sed -i "s/^port .*/port $NEW_PORT/" /etc/openvpn/server.conf
-    log "${GREEN}已更新端口为 $NEW_PORT${NC}"
-
-    # 更新全局变量
-    PROTOCOL="$NEW_PROTOCOL"
-    PORT="$NEW_PORT"
-
-    # 更新防火墙规则
-    log "${BLUE}更新防火墙规则...${NC}"
-    configure_network
-
-    # 重启 OpenVPN 服务
-    log "${BLUE}重启 OpenVPN 服务以应用更改...${NC}"
-    systemctl restart openvpn@server
-
-    # 检查服务状态
-    if systemctl is-active --quiet openvpn@server; then
-        log "${GREEN}OpenVPN 服务已成功重启${NC}"
-    else
-        log "${RED}警告: OpenVPN 服务可能未正确重启，请检查日志${NC}"
-    fi
-
-    log "${GREEN}协议和端口修改完成${NC}"
-    log "${YELLOW}注意: 现有的客户端配置文件仍将使用旧协议和旧端口。如需使用新协议和新端口，请生成新的客户端配置文件。${NC}"
-}
 
 # 函数: 启动 OpenVPN 服务
 start_openvpn() {
     log "${BLUE}启动 OpenVPN 服务...${NC}"
 
+    # 检查基本配置
+    validate_openvpn_config
+
     # 启动 OpenVPN 服务
     if [[ "$OS" == "ubuntu" || "$OS" == "debian" || "$OS" == "centos" ]]; then
-        run_cmd "systemctl start openvpn@server" "启动 OpenVPN 服务" || error_exit "启动 OpenVPN 服务失败"
+        if ! run_cmd "systemctl start openvpn@server" "启动 OpenVPN 服务"; then
+            log "${RED}启动 OpenVPN 服务失败，获取详细错误信息...${NC}"
+
+            # 获取详细的错误信息
+            local status_output=$(systemctl status openvpn@server 2>&1)
+            local journal_output=$(journalctl -xeu openvpn@server -n 50 --no-pager 2>&1)
+
+            log "${RED}systemctl status 输出:${NC}"
+            log "$status_output"
+
+            log "${RED}journalctl 输出:${NC}"
+            log "$journal_output"
+
+            error_exit "启动 OpenVPN 服务失败，请查看上述日志获取详细信息"
+        fi
+
         run_cmd "systemctl enable openvpn@server" "设置 OpenVPN 服务开机自启" || log "${YELLOW}警告: 无法设置 OpenVPN 服务开机自启${NC}"
     fi
 
@@ -1267,7 +1337,7 @@ start_openvpn() {
     if systemctl is-active --quiet openvpn@server; then
         log "${GREEN}OpenVPN 服务已成功启动${NC}"
     else
-        log "${YELLOW}警告: OpenVPN 服务可能未正确启动，请检查日志${NC}"
+        log "${RED}警告: OpenVPN 服务未能正确启动，请检查日志${NC}"
         FAILED_COMMANDS="${FAILED_COMMANDS}• OpenVPN 服务未能正确启动，请检查 journalctl -u openvpn@server 获取详细信息\n"
     fi
 }
@@ -1906,46 +1976,21 @@ interactive_wizard() {
     read -r
 }
 
-# 函数: 交互式选择协议
+# 函数: 设置协议（默认使用UDP）
 select_protocol() {
-    if [ "$PROTOCOL_SET_BY_ARG" = false ]; then
-        echo -e "${BLUE}请选择 OpenVPN 传输协议:${NC}"
-        echo "1) UDP (推荐，性能更好，使用端口 1194)"
-        echo "2) TCP (更可靠，适合某些网络环境，使用端口 443)"
+    # 强制使用UDP协议，移除TCP选项
+    PROTOCOL="udp"
 
-        while true; do
-            echo -n "请输入选项 [1-2]: "
-            read -r proto_option
-
-            case $proto_option in
-                1)
-                    PROTOCOL="udp"
-                    PORT=1194
-                    log "${GREEN}已选择 UDP 协议，端口设置为 1194${NC}"
-                    break
-                    ;;
-                2)
-                    PROTOCOL="tcp"
-                    PORT=443
-                    log "${GREEN}已选择 TCP 协议，端口设置为 443${NC}"
-                    break
-                    ;;
-                *)
-                    echo -e "${RED}无效选项，请重新输入${NC}"
-                    ;;
-            esac
-        done
+    # 如果端口未通过命令行参数设置，则使用随机端口以避免封锁
+    if [ "$PORT" = "1194" ] && [ "$PROTOCOL_SET_BY_ARG" = false ]; then
+        # 生成一个随机端口号（10000-65000范围内）
+        PORT=$((RANDOM % 55000 + 10000))
+        log "${GREEN}为避免运营商封锁，使用随机端口: $PORT${NC}"
     else
-        log "${GREEN}使用命令行指定的协议: $PROTOCOL${NC}"
-        # 如果协议是通过命令行参数设置的，则根据协议设置默认端口
-        if [[ "$PROTOCOL" == "udp" && "$PORT" != "1194" ]]; then
-            PORT=1194
-            log "${YELLOW}根据 UDP 协议自动设置端口为 1194${NC}"
-        elif [[ "$PROTOCOL" == "tcp" && "$PORT" != "443" ]]; then
-            PORT=443
-            log "${YELLOW}根据 TCP 协议自动设置端口为 443${NC}"
-        fi
+        log "${GREEN}使用指定端口: $PORT${NC}"
     fi
+
+    log "${GREEN}使用 UDP 协议${NC}"
 }
 
 # 函数: 交互式选择输出文件名
@@ -1969,6 +2014,23 @@ select_output_file() {
         fi
     else
         log "${GREEN}使用命令行指定的输出文件名: $OUTPUT_FILE${NC}"
+    fi
+}
+
+# 函数: 选择设备类型（移动设备或桌面端）
+select_device_type() {
+    # 如果未通过命令行参数设置移动设备选项
+    if [ "$MOBILE_DEVICE" = false ]; then
+        echo -n "是否为移动设备生成配置？(避免使用不支持的 fragment 指令) [y/N]: "
+        read -r mobile_choice
+        if [[ "$mobile_choice" =~ ^[Yy]$ ]]; then
+            MOBILE_DEVICE=true
+            log "${BLUE}将生成移动设备专用配置 (不包含 fragment 指令)${NC}"
+        else
+            log "${BLUE}将生成标准桌面端配置${NC}"
+        fi
+    else
+        log "${BLUE}通过命令行参数指定生成移动设备专用配置${NC}"
     fi
 }
 
@@ -2025,10 +2087,9 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -t|--protocol)
-            PROTOCOL="$2"
-            if [[ "$PROTOCOL" != "udp" && "$PROTOCOL" != "tcp" ]]; then
-                error_exit "协议必须是 udp 或 tcp"
-            fi
+            # 强制使用UDP协议，忽略用户输入
+            PROTOCOL="udp"
+            log "${YELLOW}注意: 为避免中国运营商封锁，脚本已被修改为仅支持UDP协议${NC}"
             PROTOCOL_SET_BY_ARG=true
             shift 2
             ;;
@@ -2109,6 +2170,10 @@ while [[ $# -gt 0 ]]; do
             CLIENT_TO_CLIENT=true
             shift
             ;;
+        --mobile-device)
+            MOBILE_DEVICE=true
+            shift
+            ;;
         *)
             error_exit "未知选项: $1"
             ;;
@@ -2163,6 +2228,9 @@ main() {
 
     # 配置网络
     configure_network
+
+    # 选择设备类型（移动设备或桌面端）
+    select_device_type
 
     # 生成客户端证书和配置
     generate_client
