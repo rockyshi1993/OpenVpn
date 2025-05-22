@@ -34,7 +34,7 @@
 1. 下载脚本：
 
 ```bash
-wget https://example.com/install.sh -O install.sh
+wget https://github.com/rockyshi1993/OpenVpn/blob/master/install.sh -O install.sh
 chmod +x install.sh
 ```
 
