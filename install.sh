@@ -4,10 +4,26 @@
 # 基于 install.md 文档中的步骤自动化安装和配置 OpenVPN 服务器
 # 支持 Ubuntu/Debian 和 CentOS/RHEL 系统
 #
-# 版本: 1.11
-# 最后更新: 2025-05-22
+# 版本: 1.13
+# 最后更新: 2025-05-25
 #
 # 更新日志:
+# - 1.13:
+#   - 增强卸载功能，确保完全清理所有OpenVPN相关文件和配置
+#   - 改进卸载过程，删除所有OpenVPN相关文件和配置
+#   - 增强防火墙规则清理，移除所有网络接口上的相关规则
+#   - 添加系统服务文件和网络接口脚本的清理
+#   - 添加IP转发设置的恢复
+#   - 添加客户端配置文件、运行时文件和TUN/TAP设备的清理
+#   - 添加备份文件和临时文件的清理
+#   - 更新文档以反映增强的卸载功能
+# - 1.12:
+#   - 增强ta.key文件处理和连接可靠性
+#   - 改进ta.key文件验证和生成流程，防止自动重新生成导致的连接问题
+#   - 添加"更新客户端ta.key"功能，解决客户端与服务器ta.key不匹配问题
+#   - 添加连接问题诊断功能，帮助识别和解决ta.key不匹配等连接问题
+#   - 优化连接流程，提高连接成功率
+#   - 添加ta.key更新提示，确保用户知道何时需要更新客户端配置
 # - 1.11:
 #   - 跳过OpenVPN配置文件验证，忽略压缩和ta.key相关警告
 #   - 简化服务启动流程，提高稳定性
@@ -422,15 +438,22 @@ check_openvpn_installed() {
         # 显示菜单
         echo -e "${BLUE}OpenVPN 已安装在此系统上。请选择操作:${NC}"
         echo "1) 生成新的客户端配置文件"
-        echo "2) 修复当前安装"
-        echo "3) 重启 OpenVPN 服务"
-        echo "4) 查看服务器信息"
-        echo "5) 查看 VPN 实时状态"
-        echo "6) 完全卸载 OpenVPN"
-        echo "7) 退出"
+        echo "2) 更新客户端ta.key"
+        echo "3) 诊断连接问题"
+        echo "4) 修复当前安装"
+        echo "5) 重启 OpenVPN 服务"
+        echo "6) 查看服务器信息"
+        echo "7) 查看 VPN 实时状态"
+        echo "8) 完全卸载 OpenVPN"
+        echo "9) 退出"
+
+        # 检查是否存在ta.key更新标记
+        if [ -f "/etc/openvpn/ta.key.updated" ]; then
+            echo -e "${YELLOW}注意: 检测到ta.key已被更新，建议使用选项2更新客户端配置${NC}"
+        fi
 
         while true; do
-            echo -n "请输入选项 [1-7]: "
+            echo -n "请输入选项 [1-9]: "
             read -r option
 
             case $option in
@@ -440,17 +463,31 @@ check_openvpn_installed() {
                     exit 0
                     ;;
                 2)
+                    # 更新客户端ta.key
+                    update_client_ta_key
+                    # 返回菜单
+                    check_openvpn_installed
+                    exit 0
+                    ;;
+                3)
+                    # 诊断连接问题
+                    diagnose_connection_issues
+                    # 返回菜单
+                    check_openvpn_installed
+                    exit 0
+                    ;;
+                4)
                     # 修复当前安装
                     repair_installation
                     exit 0
                     ;;
-                3)
+                5)
                     # 重启 OpenVPN 服务
                     detect_os
                     restart_openvpn
                     exit 0
                     ;;
-                4)
+                6)
                     # 查看服务器信息
                     detect_os
                     show_server_info
@@ -458,7 +495,7 @@ check_openvpn_installed() {
                     check_openvpn_installed
                     exit 0
                     ;;
-                5)
+                7)
                     # 查看 VPN 实时状态
                     detect_os
                     show_vpn_status
@@ -466,12 +503,12 @@ check_openvpn_installed() {
                     check_openvpn_installed
                     exit 0
                     ;;
-                6)
+                8)
                     # 完全卸载 OpenVPN
                     uninstall_openvpn
                     exit 0
                     ;;
-                7)
+                9)
                     log "${GREEN}用户选择退出${NC}"
                     exit 0
                     ;;
@@ -484,6 +521,130 @@ check_openvpn_installed() {
         log "${GREEN}OpenVPN 未安装${NC}"
         # 继续安装流程
     fi
+}
+
+# 函数: 更新客户端ta.key
+update_client_ta_key() {
+    log "${BLUE}开始更新客户端ta.key...${NC}"
+
+    # 检查ta.key是否存在
+    if [ ! -f "/etc/openvpn/ta.key" ]; then
+        log "${RED}错误: ta.key文件不存在，无法更新客户端配置${NC}"
+        return 1
+    fi
+
+    # 检查客户端配置目录
+    local client_configs_dir="/etc/openvpn/client-configs"
+    if [ ! -d "$client_configs_dir" ]; then
+        log "${RED}错误: 客户端配置目录不存在${NC}"
+        return 1
+    fi
+
+    # 获取现有客户端列表
+    local clients=()
+    local client_certs=()
+
+    # 从证书目录获取客户端列表
+    if [ -d "/etc/openvpn/easy-rsa/pki/issued" ]; then
+        for cert in /etc/openvpn/easy-rsa/pki/issued/*.crt; do
+            if [ -f "$cert" ]; then
+                local client_name=$(basename "$cert" .crt)
+                if [ "$client_name" != "server" ] && [ "$client_name" != "$SERVER_NAME" ]; then
+                    client_certs+=("$client_name")
+                fi
+            fi
+        done
+    fi
+
+    if [ ${#client_certs[@]} -eq 0 ]; then
+        log "${RED}错误: 未找到任何客户端证书${NC}"
+        return 1
+    fi
+
+    # 显示客户端列表
+    echo -e "${BLUE}找到以下客户端证书:${NC}"
+    for i in "${!client_certs[@]}"; do
+        echo "$((i+1))) ${client_certs[$i]}"
+    done
+    echo "$((${#client_certs[@]}+1))) 更新所有客户端"
+    echo "$((${#client_certs[@]}+2))) 返回主菜单"
+
+    # 提示用户选择要更新的客户端
+    echo -n "请选择要更新的客户端 [1-$((${#client_certs[@]}+2))]: "
+    read -r client_choice
+
+    # 验证用户输入
+    if ! [[ "$client_choice" =~ ^[0-9]+$ ]] || [ "$client_choice" -lt 1 ] || [ "$client_choice" -gt $((${#client_certs[@]}+2)) ]; then
+        log "${RED}错误: 无效的选择${NC}"
+        return 1
+    fi
+
+    # 如果用户选择返回主菜单
+    if [ "$client_choice" -eq $((${#client_certs[@]}+2)) ]; then
+        return 0
+    fi
+
+    # 使用脚本目录作为默认输出目录
+    OUTPUT_DIR="$SCRIPT_DIR"
+
+    # 验证输出目录是否可写
+    if [ ! -w "$OUTPUT_DIR" ]; then
+        error_exit "输出目录 $OUTPUT_DIR 不可写"
+    fi
+
+    # 更新选定的客户端或所有客户端
+    if [ "$client_choice" -eq $((${#client_certs[@]}+1)) ]; then
+        # 更新所有客户端
+        log "${BLUE}更新所有客户端配置...${NC}"
+        local updated_count=0
+
+        for client in "${client_certs[@]}"; do
+            log "${BLUE}更新客户端 ${client}...${NC}"
+            OUTPUT_FILE="${client}.ovpn"
+
+            # 生成新的客户端配置
+            if /etc/openvpn/make_client_config.sh "$client" "$OUTPUT_DIR" "$OUTPUT_FILE" false; then
+                log "${GREEN}成功更新客户端 ${client}${NC}"
+                updated_count=$((updated_count+1))
+            else
+                log "${RED}更新客户端 ${client} 失败${NC}"
+            fi
+        done
+
+        log "${GREEN}已成功更新 ${updated_count}/${#client_certs[@]} 个客户端配置${NC}"
+    else
+        # 更新选定的客户端
+        local selected_client="${client_certs[$((client_choice-1))]}"
+        log "${BLUE}更新客户端 ${selected_client}...${NC}"
+
+        # 提示用户输入输出文件名
+        echo -n "请输入配置文件名称 [${selected_client}.ovpn]: "
+        read -r output_file
+
+        # 如果用户未输入，使用默认值
+        if [ -z "$output_file" ]; then
+            output_file="${selected_client}.ovpn"
+        elif [[ "$output_file" != *.ovpn ]]; then
+            output_file="${output_file}.ovpn"
+        fi
+
+        # 生成新的客户端配置
+        if /etc/openvpn/make_client_config.sh "$selected_client" "$OUTPUT_DIR" "$output_file" false; then
+            log "${GREEN}成功更新客户端 ${selected_client}${NC}"
+            log "${GREEN}配置文件已保存到: ${OUTPUT_DIR}/${output_file}${NC}"
+        else
+            log "${RED}更新客户端 ${selected_client} 失败${NC}"
+            return 1
+        fi
+    fi
+
+    log "${YELLOW}重要提示: 请将更新后的配置文件分发给相应的客户端，替换旧的配置文件${NC}"
+    log "${YELLOW}客户端必须使用新的配置文件才能连接到服务器${NC}"
+
+    # 等待用户按任意键继续
+    echo -e "\n按任意键返回主菜单..."
+    read -n 1 -s
+    return 0
 }
 
 # 函数: 生成新的客户端配置文件
@@ -648,8 +809,16 @@ uninstall_openvpn() {
 
     # 停止 OpenVPN 服务
     log "${BLUE}停止 OpenVPN 服务...${NC}"
-    systemctl stop openvpn@server
-    systemctl disable openvpn@server
+    systemctl stop openvpn@server 2>/dev/null
+    systemctl disable openvpn@server 2>/dev/null
+
+    # 停止所有 OpenVPN 服务实例
+    log "${BLUE}停止所有 OpenVPN 服务实例...${NC}"
+    for service in $(systemctl list-units --full --all | grep -F "openvpn" | awk '{print $1}'); do
+        systemctl stop "$service" 2>/dev/null
+        systemctl disable "$service" 2>/dev/null
+        log "${GREEN}已停止并禁用服务: $service${NC}"
+    done
 
     # 删除 OpenVPN 包
     log "${BLUE}删除 OpenVPN 软件包...${NC}"
@@ -663,19 +832,58 @@ uninstall_openvpn() {
     # 删除配置文件和证书
     log "${BLUE}删除配置文件和证书...${NC}"
     rm -rf /etc/openvpn
+    rm -rf /usr/share/easy-rsa
+
+    # 删除客户端配置文件
+    log "${BLUE}删除客户端配置文件...${NC}"
+    # 检查脚本目录中的客户端配置文件
+    if [ -d "$SCRIPT_DIR" ]; then
+        find "$SCRIPT_DIR" -name "*.ovpn" -delete
+        log "${GREEN}已删除脚本目录中的客户端配置文件${NC}"
+    fi
+
+    # 删除可能存在的其他客户端配置目录
+    rm -rf /etc/openvpn/client-configs
+    rm -rf /root/client-configs
+    rm -rf /home/*/client-configs
 
     # 删除日志文件
     log "${BLUE}删除日志文件...${NC}"
+    rm -rf /var/log/openvpn
     rm -f /var/log/openvpn*
+
+    # 删除运行时文件
+    log "${BLUE}删除运行时文件...${NC}"
+    rm -rf /run/openvpn
+    rm -f /run/openvpn*
+    rm -f /var/run/openvpn*
+
+    # 删除系统服务文件
+    log "${BLUE}删除系统服务文件...${NC}"
+    rm -f /lib/systemd/system/openvpn*.service
+    rm -f /usr/lib/systemd/system/openvpn*.service
+    rm -f /etc/systemd/system/openvpn*.service
+    systemctl daemon-reload
+
+    # 移除网络接口脚本
+    log "${BLUE}移除网络接口脚本...${NC}"
+    rm -f /etc/network/if-up.d/iptables
+
+    # 移除 IP 转发设置
+    log "${BLUE}移除 IP 转发设置...${NC}"
+    if grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+        sed -i '/^net.ipv4.ip_forward=1/d' /etc/sysctl.conf
+        log "${GREEN}已从 /etc/sysctl.conf 中移除 IP 转发设置${NC}"
+        # 应用更改
+        sysctl -p
+    fi
 
     # 移除防火墙规则
     log "${BLUE}移除防火墙规则...${NC}"
 
-    # 检测主网络接口
-    NIC=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
-    if [ -z "$NIC" ]; then
-        NIC="eth0"
-    fi
+    # 检测所有网络接口
+    log "${BLUE}检测所有网络接口...${NC}"
+    ALL_INTERFACES=$(ip -o -4 addr show | awk '{print $2}' | grep -v "lo" | sort | uniq)
 
     # 获取当前配置的端口和协议（如果可能）
     if [ -f "/etc/openvpn/server.conf.bak" ]; then
@@ -687,36 +895,109 @@ uninstall_openvpn() {
         CURRENT_PROTOCOL="udp"
     fi
 
-    # 移除 iptables 规则
-    iptables -D INPUT -i $NIC -p $CURRENT_PROTOCOL --dport $CURRENT_PORT -j ACCEPT 2>/dev/null
+    # 获取可能的 VPN 子网
+    VPN_SUBNETS=("10.8.0.0/24" "10.8.0.0/16" "192.168.255.0/24" "172.16.0.0/24")
+
+    # 移除所有接口上的 iptables 规则
+    for iface in $ALL_INTERFACES; do
+        log "${BLUE}移除接口 $iface 上的 iptables 规则...${NC}"
+
+        # 移除端口规则
+        iptables -D INPUT -i $iface -p $CURRENT_PROTOCOL --dport $CURRENT_PORT -j ACCEPT 2>/dev/null
+
+        # 移除 NAT 规则
+        for subnet in "${VPN_SUBNETS[@]}"; do
+            iptables -t nat -D POSTROUTING -s $subnet -o $iface -j MASQUERADE 2>/dev/null
+            iptables -t nat -D POSTROUTING -s $subnet -j SNAT --to-source $(ip -4 addr show $iface | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1) 2>/dev/null
+        done
+
+        # 移除转发规则
+        iptables -D FORWARD -i tun+ -o $iface -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -i $iface -o tun+ -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -i tun+ -o $iface -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -i $iface -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+    done
+
+    # 移除 tun 接口规则
     iptables -D INPUT -i tun+ -j ACCEPT 2>/dev/null
     iptables -D FORWARD -i tun+ -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -i tun+ -o $NIC -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -i $NIC -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-    iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o $NIC -j MASQUERADE 2>/dev/null
 
     # 保存 iptables 规则
     if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        if [ -f /etc/iptables/rules.v4 ]; then
+        if [ -d "/etc/iptables" ]; then
             iptables-save > /etc/iptables/rules.v4
+            log "${GREEN}已保存 iptables 规则${NC}"
         fi
     elif [[ "$OS" == "centos" ]]; then
-        service iptables save
+        if command -v service &>/dev/null; then
+            service iptables save
+            log "${GREEN}已保存 iptables 规则${NC}"
+        fi
     fi
 
     # 移除 UFW 规则（如果存在）
     if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
-        ufw delete allow $CURRENT_PORT/$CURRENT_PROTOCOL
+        log "${BLUE}移除 UFW 规则...${NC}"
+        ufw delete allow $CURRENT_PORT/$CURRENT_PROTOCOL 2>/dev/null
+
+        # 移除 UFW 中的 NAT 规则
+        if grep -q "POSTROUTING -s" /etc/ufw/before.rules; then
+            sed -i '/# NAT 表规则/,/COMMIT/d' /etc/ufw/before.rules
+            log "${GREEN}已从 UFW 中移除 NAT 规则${NC}"
+        fi
+
+        # 恢复 UFW 默认转发策略
+        sed -i 's/DEFAULT_FORWARD_POLICY="ACCEPT"/DEFAULT_FORWARD_POLICY="DROP"/g' /etc/default/ufw
+
+        # 重启 UFW
+        ufw disable
+        ufw enable
+        log "${GREEN}已重启 UFW${NC}"
     fi
 
     # 移除 firewalld 规则（如果存在）
     if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
-        firewall-cmd --permanent --remove-port=$CURRENT_PORT/$CURRENT_PROTOCOL
-        firewall-cmd --permanent --remove-service=openvpn
+        log "${BLUE}移除 firewalld 规则...${NC}"
+        firewall-cmd --permanent --remove-port=$CURRENT_PORT/$CURRENT_PROTOCOL 2>/dev/null
+        firewall-cmd --permanent --remove-service=openvpn 2>/dev/null
+
+        # 禁用 masquerade
+        firewall-cmd --permanent --remove-masquerade 2>/dev/null
+
+        # 重新加载 firewalld
         firewall-cmd --reload
+        log "${GREEN}已重新加载 firewalld${NC}"
     fi
 
-    log "${GREEN}OpenVPN 已成功卸载${NC}"
+    # 清理可能存在的其他文件
+    log "${BLUE}清理其他文件...${NC}"
+    rm -f /etc/openvpn*.conf
+    rm -f /etc/openvpn*.conf.bak
+    rm -f /etc/openvpn*.key
+    rm -f /etc/openvpn*.crt
+    rm -f /etc/openvpn*.pem
+    rm -f /etc/openvpn*.log
+    rm -f /etc/openvpn*.status
+    rm -f /etc/openvpn*.updated
+
+    # 删除 iptables 配置目录
+    rm -rf /etc/iptables
+    rm -rf /etc/sysconfig/iptables.d
+
+    # 删除备份文件
+    find /etc -name "*openvpn*" -type f -delete
+    find /var -name "*openvpn*" -type f -delete
+
+    # 检查是否有残留的 tun 设备
+    if ip link show | grep -q "tun"; then
+        log "${BLUE}移除残留的 tun 设备...${NC}"
+        for tun in $(ip link show | grep "tun" | awk -F: '{print $2}' | tr -d ' '); do
+            ip link delete "$tun" 2>/dev/null
+            log "${GREEN}已移除 tun 设备: $tun${NC}"
+        done
+    fi
+
+    log "${GREEN}OpenVPN 已成功完全卸载${NC}"
 }
 
 # 函数: 安装依赖包
@@ -811,8 +1092,12 @@ check_openvpn_version() {
 }
 
 # 函数: 验证OpenVPN配置
+.# 注意: 此函数已增强，使用更可靠的方法检测和添加NAT规则
+# 1. 使用iptables -t nat -C命令精确检查NAT规则是否存在
+# 2. 添加NAT规则后验证是否成功添加
+# 3. 如果MASQUERADE方法失败，尝试使用SNAT作为备选方法
 validate_openvpn_config() {
-    log "${BLUE}跳过 OpenVPN 配置文件验证...${NC}"
+    log "${BLUE}验证 OpenVPN 配置文件...${NC}"
 
     # 检查配置文件是否存在
     if [ ! -f "/etc/openvpn/server.conf" ]; then
@@ -822,7 +1107,9 @@ validate_openvpn_config() {
 
     # 检查ta.key文件是否存在
     if [ ! -f "/etc/openvpn/ta.key" ]; then
-        log "${YELLOW}警告: ta.key文件不存在，尝试重新生成...${NC}"
+        log "${RED}错误: ta.key文件不存在${NC}"
+        log "${YELLOW}注意: 如果之前已经生成过客户端配置，重新生成ta.key将导致现有客户端无法连接${NC}"
+        log "${YELLOW}自动重新生成ta.key文件...${NC}"
         openvpn --genkey --secret /etc/openvpn/ta.key
         if [ ! -f "/etc/openvpn/ta.key" ]; then
             log "${RED}错误: 无法生成ta.key文件${NC}"
@@ -830,11 +1117,171 @@ validate_openvpn_config() {
         else
             log "${GREEN}成功生成ta.key文件${NC}"
             chmod 600 /etc/openvpn/ta.key
+            log "${YELLOW}警告: 现有客户端将无法连接，需要更新客户端配置${NC}"
+            log "${YELLOW}请运行脚本并选择'更新客户端ta.key'选项来更新客户端配置${NC}"
+            # 设置标志，表示ta.key已更新
+            echo "$(date '+%Y-%m-%d %H:%M:%S')" > /etc/openvpn/ta.key.updated
         fi
     fi
 
-    # 跳过配置验证，直接返回成功
-    log "${GREEN}已跳过 OpenVPN 配置文件验证${NC}"
+    # 检查文件权限
+    log "${BLUE}检查文件权限...${NC}"
+    if [ -f "/etc/openvpn/server.conf" ]; then
+        chmod 644 /etc/openvpn/server.conf
+        log "${GREEN}已设置server.conf权限${NC}"
+    fi
+
+    if [ -f "/etc/openvpn/ta.key" ]; then
+        chmod 600 /etc/openvpn/ta.key
+        log "${GREEN}已设置ta.key权限${NC}"
+    fi
+
+    if [ -f "/etc/openvpn/ca.crt" ]; then
+        chmod 644 /etc/openvpn/ca.crt
+        log "${GREEN}已设置ca.crt权限${NC}"
+    fi
+
+    if [ -f "/etc/openvpn/dh.pem" ]; then
+        chmod 644 /etc/openvpn/dh.pem
+        log "${GREEN}已设置dh.pem权限${NC}"
+    fi
+
+    # 检查服务器证书和密钥
+    local server_name=$(grep -E "^cert " /etc/openvpn/server.conf | awk '{print $2}' | sed 's/.crt//')
+    if [ -z "$server_name" ]; then
+        server_name="server"
+    fi
+
+    if [ -f "/etc/openvpn/${server_name}.crt" ]; then
+        chmod 644 "/etc/openvpn/${server_name}.crt"
+        log "${GREEN}已设置${server_name}.crt权限${NC}"
+    fi
+
+    if [ -f "/etc/openvpn/${server_name}.key" ]; then
+        chmod 600 "/etc/openvpn/${server_name}.key"
+        log "${GREEN}已设置${server_name}.key权限${NC}"
+    fi
+
+    # 检查IP转发是否启用
+    log "${BLUE}检查IP转发...${NC}"
+    local ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+    if [ "$ip_forward" != "1" ]; then
+        log "${YELLOW}警告: IP转发未启用，正在启用...${NC}"
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        sysctl -w net.ipv4.ip_forward=1
+        echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+        sysctl -p
+        log "${GREEN}IP转发已启用${NC}"
+    else
+        log "${GREEN}IP转发已启用${NC}"
+    fi
+
+    # 检查防火墙规则
+    log "${BLUE}检查防火墙规则...${NC}"
+    local port=$(grep -E "^port " /etc/openvpn/server.conf | awk '{print $2}')
+    local protocol=$(grep -E "^proto " /etc/openvpn/server.conf | awk '{print $2}')
+
+    if [ -z "$port" ]; then
+        port="1194"
+    fi
+
+    if [ -z "$protocol" ]; then
+        protocol="udp"
+    fi
+
+    # 检测主网络接口
+    local main_interface=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+    if [ -z "$main_interface" ]; then
+        main_interface="eth0"
+        log "${YELLOW}警告: 无法检测到主网络接口，使用默认值 eth0${NC}"
+    fi
+
+    # 检查iptables规则
+    if ! iptables -L INPUT -n | grep -q "$protocol dpt:$port"; then
+        log "${YELLOW}警告: iptables中未找到OpenVPN端口规则，正在添加...${NC}"
+        iptables -A INPUT -i $main_interface -p $protocol --dport $port -j ACCEPT
+        log "${GREEN}已添加iptables端口规则${NC}"
+    fi
+
+    # 使用iptables -C命令直接检查规则是否存在
+    if ! iptables -C INPUT -i tun+ -j ACCEPT 2>/dev/null; then
+        log "${YELLOW}警告: iptables中未找到tun接口规则，正在添加...${NC}"
+        iptables -A INPUT -i tun+ -j ACCEPT
+        iptables -A FORWARD -i tun+ -j ACCEPT
+        iptables -A FORWARD -i tun+ -o $main_interface -m state --state RELATED,ESTABLISHED -j ACCEPT
+        iptables -A FORWARD -i $main_interface -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+        log "${GREEN}已添加iptables tun接口规则${NC}"
+    fi
+
+    # 检查NAT规则
+    # 获取VPN子网
+    local vpn_subnet=$(grep -E "^server " /etc/openvpn/server.conf | awk '{print $2}')
+    local vpn_netmask=$(grep -E "^server " /etc/openvpn/server.conf | awk '{print $3}')
+
+    if [ -z "$vpn_subnet" ]; then
+        vpn_subnet="10.8.0.0"
+    fi
+
+    if [ -z "$vpn_netmask" ]; then
+        vpn_netmask="255.255.255.0"
+    fi
+
+    if ! iptables -t nat -C POSTROUTING -s $vpn_subnet/$vpn_netmask -o $main_interface -j MASQUERADE 2>/dev/null; then
+        log "${YELLOW}警告: 未找到NAT规则，正在添加...${NC}"
+        iptables -t nat -A POSTROUTING -s $vpn_subnet/$vpn_netmask -o $main_interface -j MASQUERADE
+
+        # 验证NAT规则是否已应用
+        if ! iptables -t nat -C POSTROUTING -s $vpn_subnet/$vpn_netmask -o $main_interface -j MASQUERADE 2>/dev/null; then
+            log "${RED}错误: 无法应用iptables NAT规则，尝试备选方法${NC}"
+            # 备选方法：使用SNAT而不是MASQUERADE
+            local server_ip=$(ip -4 addr show $main_interface | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+            if [ -n "$server_ip" ]; then
+                iptables -t nat -A POSTROUTING -s $vpn_subnet/$vpn_netmask -j SNAT --to-source $server_ip
+                log "${YELLOW}已尝试使用备选NAT方法${NC}"
+            else
+                log "${RED}错误: 无法获取服务器IP地址，NAT规则添加失败${NC}"
+            fi
+        else
+            log "${GREEN}已添加NAT规则${NC}"
+        fi
+    else
+        log "${GREEN}NAT规则正常${NC}"
+    fi
+
+    # 保存iptables规则
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        if [ -d "/etc/iptables" ]; then
+            iptables-save > /etc/iptables/rules.v4
+            log "${GREEN}已保存iptables规则${NC}"
+        fi
+    elif [[ "$OS" == "centos" ]]; then
+        if command -v service &>/dev/null; then
+            service iptables save
+            log "${GREEN}已保存iptables规则${NC}"
+        fi
+    fi
+
+    # 检查UFW规则(如果存在)
+    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+        if ! ufw status | grep -q "$port/$protocol"; then
+            log "${YELLOW}警告: UFW中未找到OpenVPN端口规则，正在添加...${NC}"
+            ufw allow $port/$protocol
+            log "${GREEN}已添加UFW端口规则${NC}"
+        fi
+    fi
+
+    # 检查firewalld规则(如果存在)
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+        if ! firewall-cmd --list-ports | grep -q "$port/$protocol"; then
+            log "${YELLOW}警告: firewalld中未找到OpenVPN端口规则，正在添加...${NC}"
+            firewall-cmd --permanent --add-port=$port/$protocol
+            firewall-cmd --permanent --add-service=openvpn
+            firewall-cmd --reload
+            log "${GREEN}已添加firewalld端口规则${NC}"
+        fi
+    fi
+
+    log "${GREEN}OpenVPN 配置文件验证和修复完成${NC}"
     return 0
 }
 
@@ -946,6 +1393,178 @@ check_port_open() {
     fi
 }
 
+# 函数: 验证网络配置
+verify_network_configuration() {
+    log "${BLUE}验证网络配置...${NC}"
+
+    local config_issues=false
+
+    # 验证IP转发是否启用
+    local ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+    if [ "$ip_forward" != "1" ]; then
+        log "${RED}错误: IP转发未启用，VPN客户端可能无法访问互联网${NC}"
+        log "${YELLOW}尝试再次启用IP转发...${NC}"
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        sysctl -w net.ipv4.ip_forward=1
+
+        # 再次检查
+        ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+        if [ "$ip_forward" != "1" ]; then
+            log "${RED}错误: 无法启用IP转发，请手动检查系统配置${NC}"
+            config_issues=true
+        else
+            log "${GREEN}IP转发已成功启用${NC}"
+        fi
+    else
+        log "${GREEN}IP转发已正确启用${NC}"
+    fi
+
+    # 验证NAT规则是否存在
+    local nat_rule_exists=false
+    if iptables -t nat -C POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $NIC -j MASQUERADE 2>/dev/null; then
+        nat_rule_exists=true
+        log "${GREEN}NAT规则已正确配置${NC}"
+    elif iptables -t nat -L POSTROUTING | grep -q "$VPN_SUBNET"; then
+        nat_rule_exists=true
+        log "${GREEN}找到针对VPN子网的NAT规则${NC}"
+    else
+        log "${RED}错误: 未找到NAT规则，VPN客户端可能无法访问互联网${NC}"
+        log "${YELLOW}尝试再次添加NAT规则...${NC}"
+        iptables -t nat -A POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $NIC -j MASQUERADE
+
+        # 再次检查
+        if iptables -t nat -C POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $NIC -j MASQUERADE 2>/dev/null; then
+            nat_rule_exists=true
+            log "${GREEN}NAT规则已成功添加${NC}"
+        else
+            log "${RED}错误: 无法添加NAT规则，请手动检查iptables配置${NC}"
+            config_issues=true
+        fi
+    fi
+
+    # 验证FORWARD规则是否存在
+    local forward_rule_exists=false
+    if iptables -C FORWARD -i tun+ -o $NIC -j ACCEPT 2>/dev/null; then
+        forward_rule_exists=true
+        log "${GREEN}FORWARD规则已正确配置${NC}"
+    else
+        log "${RED}错误: 未找到FORWARD规则，VPN客户端可能无法访问互联网${NC}"
+        log "${YELLOW}尝试再次添加FORWARD规则...${NC}"
+        iptables -A FORWARD -i tun+ -o $NIC -j ACCEPT
+        iptables -A FORWARD -i $NIC -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+        # 再次检查
+        if iptables -C FORWARD -i tun+ -o $NIC -j ACCEPT 2>/dev/null; then
+            forward_rule_exists=true
+            log "${GREEN}FORWARD规则已成功添加${NC}"
+        else
+            log "${RED}错误: 无法添加FORWARD规则，请手动检查iptables配置${NC}"
+            config_issues=true
+        fi
+    fi
+
+    # 验证网络接口是否有互联网连接
+    log "${BLUE}验证网络接口 $NIC 是否有互联网连接...${NC}"
+    local nic_has_internet=false
+    if ping -c 1 -I $NIC 8.8.8.8 >/dev/null 2>&1; then
+        log "${GREEN}网络接口 $NIC 可以访问互联网${NC}"
+        nic_has_internet=true
+    else
+        log "${YELLOW}警告: 网络接口 $NIC 无法访问互联网，尝试查找其他可用接口...${NC}"
+        config_issues=true
+
+        # 尝试查找其他可用接口
+        local found_interface=false
+        local internet_iface=""
+        for iface in $(ip -o -4 addr show | awk '{print $2}' | grep -v "lo" | sort | uniq); do
+            if [ "$iface" != "$NIC" ] && ping -c 1 -I $iface 8.8.8.8 >/dev/null 2>&1; then
+                log "${GREEN}找到可访问互联网的备选接口: $iface${NC}"
+                found_interface=true
+                internet_iface=$iface
+                break
+            fi
+        done
+
+        if [ "$found_interface" = true ]; then
+            log "${YELLOW}建议: 为接口 $internet_iface 添加NAT规则${NC}"
+            iptables -t nat -A POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $internet_iface -j MASQUERADE
+            log "${GREEN}已为接口 $internet_iface 添加NAT规则${NC}"
+
+            # 添加FORWARD规则
+            iptables -A FORWARD -i tun+ -o $internet_iface -j ACCEPT
+            iptables -A FORWARD -i $internet_iface -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+            log "${GREEN}已为接口 $internet_iface 添加FORWARD规则${NC}"
+
+            # 保存规则
+            if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+                iptables-save > /etc/iptables/rules.v4 || log "${YELLOW}警告: 无法保存iptables规则${NC}"
+            elif [[ "$OS" == "centos" ]]; then
+                service iptables save || log "${YELLOW}警告: 无法保存iptables规则${NC}"
+            fi
+
+            log "${GREEN}已成功配置备选接口 $internet_iface 用于VPN流量${NC}"
+        else
+            log "${RED}错误: 未找到可访问互联网的网络接口，请检查服务器网络配置${NC}"
+        fi
+    fi
+
+    # 检查是否为多网卡环境，并为所有可能的出口接口添加NAT规则
+    log "${BLUE}检查是否为多网卡环境...${NC}"
+    local interface_count=$(ip -o -4 addr show | awk '{print $2}' | grep -v "lo" | sort | uniq | wc -l)
+    if [ "$interface_count" -gt 1 ]; then
+        log "${YELLOW}检测到多网卡环境 (${interface_count}个接口)，为所有可能的出口接口添加NAT规则...${NC}"
+
+        for iface in $(ip -o -4 addr show | awk '{print $2}' | grep -v "lo" | sort | uniq); do
+            if [ "$iface" != "tun0" ] && [ "$iface" != "tun+" ]; then
+                # 检查是否已存在该接口的NAT规则
+                if ! iptables -t nat -C POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $iface -j MASQUERADE 2>/dev/null; then
+                    log "${BLUE}为接口 $iface 添加NAT规则...${NC}"
+                    iptables -t nat -A POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $iface -j MASQUERADE
+
+                    # 添加FORWARD规则
+                    iptables -A FORWARD -i tun+ -o $iface -j ACCEPT
+                    iptables -A FORWARD -i $iface -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+                    log "${GREEN}已为接口 $iface 添加NAT和FORWARD规则${NC}"
+                else
+                    log "${GREEN}接口 $iface 已存在NAT规则${NC}"
+                fi
+            fi
+        done
+
+        # 保存规则
+        if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+            iptables-save > /etc/iptables/rules.v4 || log "${YELLOW}警告: 无法保存iptables规则${NC}"
+        elif [[ "$OS" == "centos" ]]; then
+            service iptables save || log "${YELLOW}警告: 无法保存iptables规则${NC}"
+        fi
+
+        log "${GREEN}已为所有网络接口配置NAT规则${NC}"
+    else
+        log "${GREEN}单网卡环境，无需额外配置${NC}"
+    fi
+
+    # 总结验证结果
+    if [ "$ip_forward" = "1" ] && [ "$nat_rule_exists" = true ] && [ "$forward_rule_exists" = true ] && [ "$config_issues" = false ]; then
+        log "${GREEN}网络配置验证通过，VPN客户端应该能够访问互联网${NC}"
+        return 0
+    else
+        if [ "$config_issues" = true ]; then
+            log "${YELLOW}警告: 网络配置验证过程中发现并尝试修复了一些问题${NC}"
+            log "${YELLOW}如果VPN客户端仍然无法访问互联网，请尝试以下步骤:${NC}"
+            log "${YELLOW}1. 检查服务器是否有多个网络接口，确保正确的接口配置了NAT规则${NC}"
+            log "${YELLOW}2. 检查服务器防火墙是否允许VPN流量${NC}"
+            log "${YELLOW}3. 检查服务器是否有其他安全策略限制网络流量${NC}"
+            log "${YELLOW}4. 尝试重启OpenVPN服务: systemctl restart openvpn@server${NC}"
+            log "${YELLOW}5. 如果问题仍然存在，请联系系统管理员寻求帮助${NC}"
+        else
+            log "${GREEN}网络配置验证通过，但发现了一些潜在问题${NC}"
+            log "${YELLOW}建议重启OpenVPN服务以确保所有配置生效: systemctl restart openvpn@server${NC}"
+        fi
+        return 1
+    fi
+}
+
 # 函数: 配置网络
 configure_network() {
     log "${BLUE}开始配置网络...${NC}"
@@ -962,26 +1581,132 @@ configure_network() {
     check_ip_forwarding
 
     # 检测主网络接口
+    log "${BLUE}检测主网络接口...${NC}"
+
+    # 方法1: 使用默认路由
     NIC=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+    if [ -n "$NIC" ]; then
+        log "${GREEN}方法1检测到主网络接口: $NIC${NC}"
+    else
+        log "${YELLOW}方法1未检测到主网络接口${NC}"
+    fi
+
+    # 方法2: 检查具有公网IP的接口
+    if [ -z "$NIC" ]; then
+        for iface in $(ip -o -4 addr show | awk '{print $2}' | grep -v "lo" | sort | uniq); do
+            ip=$(ip -4 addr show $iface | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+            if [ -n "$ip" ] && [[ ! "$ip" =~ ^(10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.|192\.168\.) ]]; then
+                NIC=$iface
+                log "${GREEN}方法2检测到具有公网IP的网络接口: $NIC${NC}"
+                break
+            fi
+        done
+    fi
+
+    # 方法3: 检查能够访问互联网的接口
+    if [ -z "$NIC" ]; then
+        for iface in $(ip -o -4 addr show | awk '{print $2}' | grep -v "lo" | sort | uniq); do
+            if ping -c 1 -I $iface 8.8.8.8 >/dev/null 2>&1; then
+                NIC=$iface
+                log "${GREEN}方法3检测到能够访问互联网的网络接口: $NIC${NC}"
+                break
+            fi
+        done
+    fi
+
+    # 方法4: 使用最活跃的非lo接口
+    if [ -z "$NIC" ]; then
+        NIC=$(ip -o -4 addr show | awk '{print $2}' | grep -v "lo" | head -1)
+        if [ -n "$NIC" ]; then
+            log "${YELLOW}方法4使用第一个非lo网络接口: $NIC${NC}"
+        fi
+    fi
+
+    # 如果仍然没有检测到，使用默认值
     if [ -z "$NIC" ]; then
         NIC="eth0"
-        log "${YELLOW}警告: 无法检测到主网络接口，使用默认值 eth0${NC}"
-    else
-        log "${GREEN}检测到主网络接口: $NIC${NC}"
+        log "${RED}警告: 无法检测到任何网络接口，使用默认值 eth0${NC}"
     fi
+
+    # 验证检测到的接口是否存在
+    if ! ip link show $NIC >/dev/null 2>&1; then
+        log "${RED}错误: 检测到的网络接口 $NIC 不存在${NC}"
+        # 尝试找到一个存在的接口
+        for iface in eth0 ens3 ens5 ens18 ens160 ens192 enp0s3 enp0s8 enp1s0 enp2s0 enp3s0 enp4s0 enp5s0 em1 em2; do
+            if ip link show $iface >/dev/null 2>&1; then
+                NIC=$iface
+                log "${YELLOW}使用备选网络接口: $NIC${NC}"
+                break
+            fi
+        done
+    fi
+
+    log "${GREEN}最终使用的网络接口: $NIC${NC}"
 
     # 配置NAT转发规则（确保VPN流量可以通过公网网卡出去）
     log "${BLUE}配置NAT转发规则...${NC}"
+
+    # 确保之前的NAT规则被清除，避免重复规则
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" || "$OS" == "centos" ]]; then
+        log "${BLUE}清除现有NAT规则...${NC}"
+        iptables -t nat -D POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $NIC -j MASQUERADE 2>/dev/null || true
+        # 也尝试清除可能存在的任何接口的规则
+        for iface in $(ip -o -4 addr show | awk '{print $2}' | grep -v "lo" | sort | uniq); do
+            iptables -t nat -D POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $iface -j MASQUERADE 2>/dev/null || true
+        done
+    fi
+
     if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
         # 使用 iptables 设置NAT规则
+        log "${BLUE}使用iptables设置NAT规则...${NC}"
         iptables -t nat -A POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $NIC -j MASQUERADE
 
+        # 验证NAT规则是否已应用
+        if ! iptables -t nat -C POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $NIC -j MASQUERADE 2>/dev/null; then
+            log "${RED}错误: 无法应用iptables NAT规则，尝试备选方法${NC}"
+            # 备选方法：使用SNAT而不是MASQUERADE
+            iptables -t nat -A POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -j SNAT --to-source $(ip -4 addr show $NIC | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+
+            # 再次验证
+            if ! iptables -t nat -L POSTROUTING | grep -q "$VPN_SUBNET"; then
+                log "${RED}错误: 备选NAT方法也失败，VPN客户端可能无法访问互联网${NC}"
+            else
+                log "${GREEN}备选NAT方法应用成功${NC}"
+            fi
+        else
+            log "${GREEN}iptables NAT规则应用成功${NC}"
+        fi
+
         # 保存NAT规则
+        log "${BLUE}保存iptables规则...${NC}"
         mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 || log "${YELLOW}警告: 无法保存 iptables 规则${NC}"
+        if ! iptables-save > /etc/iptables/rules.v4; then
+            log "${YELLOW}警告: 无法保存iptables规则到文件，尝试使用其他方法${NC}"
+            # 尝试使用其他方法保存规则
+            if command -v netfilter-persistent &>/dev/null; then
+                netfilter-persistent save || log "${RED}错误: netfilter-persistent保存失败${NC}"
+            elif command -v iptables-persistent &>/dev/null; then
+                iptables-persistent save || log "${RED}错误: iptables-persistent保存失败${NC}"
+            fi
+        else
+            log "${GREEN}iptables规则保存成功${NC}"
+        fi
+
+        # 确保规则在启动时加载
+        if [ ! -f /etc/network/if-up.d/iptables ]; then
+            log "${BLUE}创建网络接口启动脚本以加载iptables规则...${NC}"
+            cat > /etc/network/if-up.d/iptables << EOF
+#!/bin/sh
+iptables-restore < /etc/iptables/rules.v4
+exit 0
+EOF
+            chmod +x /etc/network/if-up.d/iptables
+            log "${GREEN}网络接口启动脚本创建成功${NC}"
+        fi
 
         # 配置 UFW NAT规则 (如果存在)
         if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+            log "${BLUE}配置UFW NAT规则...${NC}"
             # 检查 NAT 规则是否已存在
             if ! grep -q "POSTROUTING -s $VPN_SUBNET/$VPN_NETMASK -o $NIC -j MASQUERADE" /etc/ufw/before.rules; then
                 # 编辑 UFW 配置
@@ -998,23 +1723,84 @@ EOF
                 sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/g' /etc/default/ufw
 
                 # 重启 UFW
+                log "${BLUE}重启UFW...${NC}"
                 ufw disable
                 ufw enable
+                log "${GREEN}UFW重启完成${NC}"
+            else
+                log "${GREEN}UFW NAT规则已存在${NC}"
             fi
         fi
     elif [[ "$OS" == "centos" ]]; then
         # 使用 firewalld 设置NAT规则 (如果存在)
         if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+            log "${BLUE}使用firewalld设置NAT规则...${NC}"
             firewall-cmd --permanent --add-masquerade
             firewall-cmd --reload
+
+            # 验证masquerade是否已启用
+            if ! firewall-cmd --query-masquerade; then
+                log "${RED}错误: firewalld masquerade未启用，尝试使用iptables${NC}"
+                iptables -t nat -A POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $NIC -j MASQUERADE
+                service iptables save || log "${YELLOW}警告: 无法保存iptables规则${NC}"
+            else
+                log "${GREEN}firewalld masquerade已启用${NC}"
+            fi
         else
             # 使用 iptables 设置NAT规则
+            log "${BLUE}使用iptables设置NAT规则...${NC}"
             iptables -t nat -A POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $NIC -j MASQUERADE
 
+            # 验证NAT规则是否已应用
+            if ! iptables -t nat -C POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -o $NIC -j MASQUERADE 2>/dev/null; then
+                log "${RED}错误: 无法应用iptables NAT规则，尝试备选方法${NC}"
+                # 备选方法：使用SNAT而不是MASQUERADE
+                iptables -t nat -A POSTROUTING -s "$VPN_SUBNET/$VPN_NETMASK" -j SNAT --to-source $(ip -4 addr show $NIC | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+            else
+                log "${GREEN}iptables NAT规则应用成功${NC}"
+            fi
+
             # 保存规则
-            service iptables save || log "${YELLOW}警告: 无法保存 iptables 规则${NC}"
+            log "${BLUE}保存iptables规则...${NC}"
+            if ! service iptables save; then
+                log "${YELLOW}警告: 无法通过service保存iptables规则，尝试其他方法${NC}"
+                # 尝试直接保存
+                if [ -d /etc/sysconfig ]; then
+                    mkdir -p /etc/sysconfig/iptables.d
+                    iptables-save > /etc/sysconfig/iptables
+                    log "${GREEN}iptables规则已保存到/etc/sysconfig/iptables${NC}"
+                fi
+            else
+                log "${GREEN}iptables规则保存成功${NC}"
+            fi
         fi
     fi
+
+    # 添加额外的NAT规则以确保所有流量都能正确路由
+    log "${BLUE}添加额外的NAT和路由规则...${NC}"
+
+    # 确保所有VPN客户端流量都能通过服务器的默认网关
+    iptables -A FORWARD -i tun+ -o $NIC -j ACCEPT
+    iptables -A FORWARD -i $NIC -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+    # 验证转发规则
+    if ! iptables -C FORWARD -i tun+ -o $NIC -j ACCEPT 2>/dev/null; then
+        log "${RED}错误: 无法应用FORWARD规则，VPN客户端可能无法访问互联网${NC}"
+    else
+        log "${GREEN}FORWARD规则应用成功${NC}"
+    fi
+
+    # 保存所有规则
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        iptables-save > /etc/iptables/rules.v4 || log "${YELLOW}警告: 无法保存最终iptables规则${NC}"
+    elif [[ "$OS" == "centos" ]]; then
+        service iptables save || log "${YELLOW}警告: 无法保存最终iptables规则${NC}"
+    fi
+
+    log "${GREEN}NAT和路由规则配置完成${NC}"
+
+    # 验证网络配置
+    verify_network_configuration
 
     # 检查端口是否已开放
     if check_port_open "$PORT" "$PROTOCOL"; then
@@ -1544,6 +2330,468 @@ show_server_info() {
     # 等待用户按任意键继续
     echo -e "\n按任意键返回主菜单..."
     read -n 1 -s
+}
+
+# 函数: 诊断连接问题
+# 注意: 此函数已增强，使用更可靠的方法检测和添加NAT规则
+# 1. 使用iptables -t nat -C命令精确检查NAT规则是否存在
+# 2. 添加NAT规则后验证是否成功添加
+# 3. 如果MASQUERADE方法失败，尝试使用SNAT作为备选方法
+# 4. 在重启服务前再次检查并尝试添加NAT规则
+# 5. 在诊断输出中同时检查MASQUERADE和SNAT规则
+diagnose_connection_issues() {
+    log "${BLUE}开始诊断连接问题...${NC}"
+
+    # 检查 OpenVPN 是否已安装
+    if ! command -v openvpn &>/dev/null; then
+        log "${RED}错误: OpenVPN 未安装${NC}"
+        log "${YELLOW}尝试安装 OpenVPN...${NC}"
+
+        # 检测操作系统
+        if [ -f /etc/debian_version ]; then
+            OS="debian"
+            if [ -f /etc/lsb-release ]; then
+                OS="ubuntu"
+            fi
+        elif [ -f /etc/redhat-release ]; then
+            OS="centos"
+        else
+            log "${RED}不支持的操作系统。此脚本仅支持 Ubuntu、Debian 和 CentOS/RHEL。${NC}"
+            return 1
+        fi
+
+        # 安装OpenVPN
+        if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+            apt update
+            apt install -y openvpn easy-rsa
+        elif [[ "$OS" == "centos" ]]; then
+            yum install -y epel-release
+            yum install -y openvpn easy-rsa
+        fi
+
+        # 检查安装结果
+        if ! command -v openvpn &>/dev/null; then
+            log "${RED}安装 OpenVPN 失败${NC}"
+            return 1
+        else
+            log "${GREEN}成功安装 OpenVPN${NC}"
+        fi
+    fi
+
+    # 检查 OpenVPN 是否正在运行
+    if ! systemctl is-active --quiet openvpn@server; then
+        log "${RED}错误: OpenVPN 服务未运行${NC}"
+        log "${YELLOW}尝试启动 OpenVPN 服务...${NC}"
+        systemctl start openvpn@server
+        sleep 2
+        if ! systemctl is-active --quiet openvpn@server; then
+            log "${RED}无法启动 OpenVPN 服务${NC}"
+            log "${YELLOW}检查服务日志...${NC}"
+            journalctl -u openvpn@server -n 20 --no-pager
+
+            # 尝试修复服务配置
+            log "${YELLOW}尝试修复服务配置...${NC}"
+
+            # 检查服务单元文件
+            if [ ! -f "/lib/systemd/system/openvpn@.service" ] && [ ! -f "/usr/lib/systemd/system/openvpn@.service" ]; then
+                log "${YELLOW}创建OpenVPN服务单元文件...${NC}"
+                cat > /lib/systemd/system/openvpn@.service << EOF
+[Unit]
+Description=OpenVPN connection to %i
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/sbin/openvpn --daemon --writepid /run/openvpn/%i.pid --cd /etc/openvpn/ --config %i.conf
+PIDFile=/run/openvpn/%i.pid
+WorkingDirectory=/etc/openvpn
+ProtectSystem=yes
+CapabilityBoundingSet=CAP_IPC_LOCK CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SETGID CAP_SETUID CAP_SYS_CHROOT CAP_DAC_OVERRIDE
+LimitNPROC=10
+DeviceAllow=/dev/null rw
+DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                mkdir -p /run/openvpn
+                systemctl daemon-reload
+            fi
+
+            # 再次尝试启动服务
+            systemctl start openvpn@server
+            sleep 2
+            if ! systemctl is-active --quiet openvpn@server; then
+                log "${RED}修复后仍无法启动服务，请检查配置文件${NC}"
+
+                # 检查配置文件
+                if [ -f "/etc/openvpn/server.conf" ]; then
+                    log "${YELLOW}验证配置文件...${NC}"
+                    openvpn --config /etc/openvpn/server.conf --test-crypto
+                fi
+
+                return 1
+            else
+                log "${GREEN}修复后成功启动服务${NC}"
+            fi
+        else
+            log "${GREEN}成功启动 OpenVPN 服务${NC}"
+        fi
+    fi
+
+    # 检查ta.key是否存在
+    if [ ! -f "/etc/openvpn/ta.key" ]; then
+        log "${RED}错误: ta.key文件不存在${NC}"
+        log "${YELLOW}正在生成ta.key文件...${NC}"
+        openvpn --genkey --secret /etc/openvpn/ta.key
+        if [ ! -f "/etc/openvpn/ta.key" ]; then
+            log "${RED}无法生成ta.key文件${NC}"
+            return 1
+        else
+            log "${GREEN}成功生成ta.key文件${NC}"
+            chmod 600 /etc/openvpn/ta.key
+            # 设置标志，表示ta.key已更新
+            echo "$(date '+%Y-%m-%d %H:%M:%S')" > /etc/openvpn/ta.key.updated
+            log "${YELLOW}警告: 现有客户端将无法连接，需要更新客户端配置${NC}"
+        fi
+    fi
+
+    # 检查ta.key是否最近被更新
+    if [ -f "/etc/openvpn/ta.key.updated" ]; then
+        log "${YELLOW}警告: ta.key文件已被更新${NC}"
+        log "${YELLOW}这可能导致现有客户端无法连接${NC}"
+        log "${YELLOW}请使用'更新客户端ta.key'选项更新客户端配置${NC}"
+    fi
+
+    # 检查文件权限
+    log "${BLUE}检查文件权限...${NC}"
+    if [ -f "/etc/openvpn/server.conf" ]; then
+        chmod 644 /etc/openvpn/server.conf
+        log "${GREEN}已设置server.conf权限${NC}"
+    fi
+
+    if [ -f "/etc/openvpn/ta.key" ]; then
+        chmod 600 /etc/openvpn/ta.key
+        log "${GREEN}已设置ta.key权限${NC}"
+    fi
+
+    if [ -f "/etc/openvpn/ca.crt" ]; then
+        chmod 644 /etc/openvpn/ca.crt
+        log "${GREEN}已设置ca.crt权限${NC}"
+    fi
+
+    if [ -f "/etc/openvpn/dh.pem" ]; then
+        chmod 644 /etc/openvpn/dh.pem
+        log "${GREEN}已设置dh.pem权限${NC}"
+    fi
+
+    # 检查服务器证书和密钥
+    local server_name=$(grep -E "^cert " /etc/openvpn/server.conf | awk '{print $2}' | sed 's/.crt//')
+    if [ -z "$server_name" ]; then
+        server_name="server"
+    fi
+
+    if [ -f "/etc/openvpn/${server_name}.crt" ]; then
+        chmod 644 "/etc/openvpn/${server_name}.crt"
+        log "${GREEN}已设置${server_name}.crt权限${NC}"
+    fi
+
+    if [ -f "/etc/openvpn/${server_name}.key" ]; then
+        chmod 600 "/etc/openvpn/${server_name}.key"
+        log "${GREEN}已设置${server_name}.key权限${NC}"
+    fi
+
+    # 检查防火墙设置
+    log "${BLUE}检查防火墙设置...${NC}"
+    local port=$(grep -E "^port " /etc/openvpn/server.conf | awk '{print $2}')
+    local protocol=$(grep -E "^proto " /etc/openvpn/server.conf | awk '{print $2}')
+
+    if [ -z "$port" ]; then
+        port="1194"
+    fi
+
+    if [ -z "$protocol" ]; then
+        protocol="udp"
+    fi
+
+    # 检测主网络接口
+    local main_interface=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+    if [ -z "$main_interface" ]; then
+        main_interface="eth0"
+        log "${YELLOW}警告: 无法检测到主网络接口，使用默认值 eth0${NC}"
+    fi
+
+    # 检查iptables
+    if ! iptables -L INPUT -n | grep -q "$protocol dpt:$port"; then
+        log "${YELLOW}警告: iptables中未找到OpenVPN端口规则，正在添加...${NC}"
+        iptables -A INPUT -i $main_interface -p $protocol --dport $port -j ACCEPT
+        log "${GREEN}已添加iptables端口规则${NC}"
+    else
+        log "${GREEN}iptables防火墙规则正常${NC}"
+    fi
+
+    # 检查tun接口规则
+    if ! iptables -C INPUT -i tun+ -j ACCEPT 2>/dev/null; then
+        log "${YELLOW}警告: iptables中未找到tun接口规则，正在添加...${NC}"
+        iptables -A INPUT -i tun+ -j ACCEPT
+        iptables -A FORWARD -i tun+ -j ACCEPT
+        iptables -A FORWARD -i tun+ -o $main_interface -m state --state RELATED,ESTABLISHED -j ACCEPT
+        iptables -A FORWARD -i $main_interface -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+        log "${GREEN}已添加iptables tun接口规则${NC}"
+    fi
+
+    # 检查UFW
+    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+        if ! ufw status | grep -q "$port/$protocol"; then
+            log "${YELLOW}警告: UFW中未找到OpenVPN端口规则，正在添加...${NC}"
+            ufw allow $port/$protocol
+            log "${GREEN}已添加UFW端口规则${NC}"
+        else
+            log "${GREEN}UFW防火墙规则正常${NC}"
+        fi
+    fi
+
+    # 检查firewalld
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+        if ! firewall-cmd --list-ports | grep -q "$port/$protocol"; then
+            log "${YELLOW}警告: firewalld中未找到OpenVPN端口规则，正在添加...${NC}"
+            firewall-cmd --permanent --add-port=$port/$protocol
+            firewall-cmd --permanent --add-service=openvpn
+            firewall-cmd --reload
+            log "${GREEN}已添加firewalld端口规则${NC}"
+        else
+            log "${GREEN}firewalld防火墙规则正常${NC}"
+        fi
+    fi
+
+    # 检查IP转发
+    log "${BLUE}检查IP转发...${NC}"
+    local ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+    if [ "$ip_forward" != "1" ]; then
+        log "${YELLOW}警告: IP转发未启用，正在启用...${NC}"
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        sysctl -w net.ipv4.ip_forward=1
+        echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+        sysctl -p
+        log "${GREEN}IP转发已启用${NC}"
+    else
+        log "${GREEN}IP转发已启用${NC}"
+    fi
+
+    # 检查NAT规则
+    log "${BLUE}检查NAT规则...${NC}"
+    if [ -z "$main_interface" ]; then
+        log "${YELLOW}警告: 无法检测到主网络接口${NC}"
+    else
+        # 获取VPN子网
+        local vpn_subnet=$(grep -E "^server " /etc/openvpn/server.conf | awk '{print $2}')
+        local vpn_netmask=$(grep -E "^server " /etc/openvpn/server.conf | awk '{print $3}')
+
+        if [ -z "$vpn_subnet" ]; then
+            vpn_subnet="10.8.0.0"
+        fi
+
+        if [ -z "$vpn_netmask" ]; then
+            vpn_netmask="255.255.255.0"
+        fi
+
+        if ! iptables -t nat -C POSTROUTING -s $vpn_subnet/$vpn_netmask -o $main_interface -j MASQUERADE 2>/dev/null; then
+            log "${YELLOW}警告: 未找到NAT规则，正在添加...${NC}"
+            iptables -t nat -A POSTROUTING -s $vpn_subnet/$vpn_netmask -o $main_interface -j MASQUERADE
+
+            # 验证NAT规则是否已应用
+            if ! iptables -t nat -C POSTROUTING -s $vpn_subnet/$vpn_netmask -o $main_interface -j MASQUERADE 2>/dev/null; then
+                log "${RED}错误: 无法应用iptables NAT规则，尝试备选方法${NC}"
+                # 备选方法：使用SNAT而不是MASQUERADE
+                local server_ip=$(ip -4 addr show $main_interface | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+                if [ -n "$server_ip" ]; then
+                    iptables -t nat -A POSTROUTING -s $vpn_subnet/$vpn_netmask -j SNAT --to-source $server_ip
+                    log "${YELLOW}已尝试使用备选NAT方法${NC}"
+                else
+                    log "${RED}错误: 无法获取服务器IP地址，NAT规则添加失败${NC}"
+                fi
+            else
+                log "${GREEN}已添加NAT规则${NC}"
+            fi
+        else
+            log "${GREEN}NAT规则正常${NC}"
+        fi
+
+        # 保存iptables规则
+        if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+            if [ -d "/etc/iptables" ]; then
+                iptables-save > /etc/iptables/rules.v4
+                log "${GREEN}已保存iptables规则${NC}"
+            fi
+        elif [[ "$OS" == "centos" ]]; then
+            if command -v service &>/dev/null; then
+                service iptables save
+                log "${GREEN}已保存iptables规则${NC}"
+            fi
+        fi
+    fi
+
+    # 检查日志文件中的错误
+    log "${BLUE}检查OpenVPN日志文件...${NC}"
+    local log_found=false
+    local log_files=("/var/log/openvpn.log" "/var/log/openvpn/openvpn.log" "/etc/openvpn/openvpn.log")
+
+    for log_file in "${log_files[@]}"; do
+        if [ -f "$log_file" ]; then
+            log_found=true
+            local auth_errors=$(grep -i "auth" "$log_file" | grep -i "fail\|error" | tail -5)
+            local tls_errors=$(grep -i "tls" "$log_file" | grep -i "fail\|error" | tail -5)
+            local ta_errors=$(grep -i "ta.key" "$log_file" | grep -i "fail\|error" | tail -5)
+
+            if [ -n "$auth_errors" ]; then
+                log "${YELLOW}发现认证错误:${NC}"
+                echo "$auth_errors"
+                log "${YELLOW}这可能表明客户端证书有问题${NC}"
+                log "${YELLOW}建议重新生成客户端证书${NC}"
+            fi
+
+            if [ -n "$tls_errors" ]; then
+                log "${YELLOW}发现TLS错误:${NC}"
+                echo "$tls_errors"
+                log "${YELLOW}这可能表明TLS设置有问题${NC}"
+                log "${YELLOW}正在检查TLS设置...${NC}"
+
+                # 检查TLS版本设置
+                local tls_version=$(grep -E "^tls-version-min " /etc/openvpn/server.conf | awk '{print $2}')
+                if [ -z "$tls_version" ]; then
+                    log "${YELLOW}未找到TLS版本设置，添加默认设置...${NC}"
+                    echo "tls-version-min 1.2" >> /etc/openvpn/server.conf
+                    log "${GREEN}已添加TLS版本设置${NC}"
+                fi
+            fi
+
+            if [ -n "$ta_errors" ]; then
+                log "${YELLOW}发现ta.key错误:${NC}"
+                echo "$ta_errors"
+                log "${YELLOW}这可能表明客户端和服务器的ta.key不匹配${NC}"
+                log "${YELLOW}正在重新生成ta.key...${NC}"
+
+                # 备份旧的ta.key
+                if [ -f "/etc/openvpn/ta.key" ]; then
+                    cp /etc/openvpn/ta.key /etc/openvpn/ta.key.bak
+                    log "${GREEN}已备份旧的ta.key${NC}"
+                fi
+
+                # 生成新的ta.key
+                openvpn --genkey --secret /etc/openvpn/ta.key
+                chmod 600 /etc/openvpn/ta.key
+                echo "$(date '+%Y-%m-%d %H:%M:%S')" > /etc/openvpn/ta.key.updated
+                log "${GREEN}已重新生成ta.key${NC}"
+                log "${YELLOW}请使用'更新客户端ta.key'选项更新客户端配置${NC}"
+            fi
+
+            break
+        fi
+    done
+
+    if [ "$log_found" = false ]; then
+        log "${YELLOW}未找到OpenVPN日志文件，创建日志目录...${NC}"
+        mkdir -p /var/log/openvpn
+        touch /var/log/openvpn/openvpn.log
+        chmod 644 /var/log/openvpn/openvpn.log
+
+        # 确保日志设置在配置文件中
+        if [ -f "/etc/openvpn/server.conf" ]; then
+            if ! grep -q "^log " /etc/openvpn/server.conf; then
+                echo "log /var/log/openvpn/openvpn.log" >> /etc/openvpn/server.conf
+                log "${GREEN}已添加日志设置到配置文件${NC}"
+            fi
+        fi
+    fi
+
+    # 重启OpenVPN服务以应用更改
+    log "${BLUE}重启OpenVPN服务以应用更改...${NC}"
+
+    # 确保NAT规则已正确应用
+    log "${BLUE}确保NAT规则已正确应用...${NC}"
+    if [ -n "$main_interface" ] && [ -n "$vpn_subnet" ] && [ -n "$vpn_netmask" ]; then
+        if ! iptables -t nat -C POSTROUTING -s $vpn_subnet/$vpn_netmask -o $main_interface -j MASQUERADE 2>/dev/null; then
+            log "${YELLOW}再次尝试添加NAT规则...${NC}"
+            iptables -t nat -A POSTROUTING -s $vpn_subnet/$vpn_netmask -o $main_interface -j MASQUERADE
+
+            # 验证NAT规则是否已应用
+            if ! iptables -t nat -C POSTROUTING -s $vpn_subnet/$vpn_netmask -o $main_interface -j MASQUERADE 2>/dev/null; then
+                log "${RED}错误: 无法应用iptables NAT规则，尝试备选方法${NC}"
+                # 备选方法：使用SNAT而不是MASQUERADE
+                local server_ip=$(ip -4 addr show $main_interface | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+                if [ -n "$server_ip" ]; then
+                    iptables -t nat -A POSTROUTING -s $vpn_subnet/$vpn_netmask -j SNAT --to-source $server_ip
+                    log "${YELLOW}已尝试使用备选NAT方法${NC}"
+                else
+                    log "${RED}错误: 无法获取服务器IP地址，NAT规则添加失败${NC}"
+                fi
+            else
+                log "${GREEN}已成功添加NAT规则${NC}"
+            fi
+
+            # 保存iptables规则
+            if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+                if [ -d "/etc/iptables" ]; then
+                    iptables-save > /etc/iptables/rules.v4
+                    log "${GREEN}已保存iptables规则${NC}"
+                fi
+            elif [[ "$OS" == "centos" ]]; then
+                if command -v service &>/dev/null; then
+                    service iptables save
+                    log "${GREEN}已保存iptables规则${NC}"
+                fi
+            fi
+        else
+            log "${GREEN}NAT规则已正确应用${NC}"
+        fi
+    fi
+
+    systemctl restart openvpn@server
+    sleep 2
+    if systemctl is-active --quiet openvpn@server; then
+        log "${GREEN}OpenVPN服务已成功重启${NC}"
+    else
+        log "${RED}OpenVPN服务重启失败${NC}"
+        log "${YELLOW}检查服务日志...${NC}"
+        journalctl -u openvpn@server -n 20 --no-pager
+    fi
+
+    # 输出诊断结果摘要 - 使用与问题描述中相同的格式
+    echo ""
+    echo -e "${GREEN}诊断提示${NC}"
+
+    # 检查NAT规则并输出警告
+    if [ -z "$main_interface" ]; then
+        echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}警告: 无法检测到主网络接口${NC}"
+        echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}这可能导致客户端无法访问互联网${NC}"
+    elif ! iptables -t nat -C POSTROUTING -s $vpn_subnet/$vpn_netmask -o $main_interface -j MASQUERADE 2>/dev/null; then
+        # 检查是否使用了备选SNAT方法
+        local server_ip=$(ip -4 addr show $main_interface | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+        if [ -n "$server_ip" ] && iptables -t nat -C POSTROUTING -s $vpn_subnet/$vpn_netmask -j SNAT --to-source $server_ip 2>/dev/null; then
+            echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${GREEN}使用备选SNAT方法配置了NAT规则${NC}"
+        else
+            echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}警告: 未找到NAT规则${NC}"
+            echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}这可能导致客户端无法访问互联网${NC}"
+        fi
+    fi
+
+    # 检查OpenVPN日志文件
+    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}检查OpenVPN日志文件...${NC}"
+    if [ "$log_found" = false ]; then
+        echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}未找到OpenVPN日志文件${NC}"
+    fi
+
+    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${GREEN}诊断和修复完成${NC}"
+    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}如果您仍然遇到连接问题，请尝试以下操作:${NC}"
+    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}1. 使用'更新客户端ta.key'选项更新客户端配置${NC}"
+    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}2. 使用'修复当前安装'选项修复安装${NC}"
+    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}3. 重启OpenVPN服务${NC}"
+    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${YELLOW}4. 检查客户端日志以获取更多信息${NC}"
+
+    # 等待用户按任意键继续
+    echo -e "\n按任意键返回主菜单..."
+    read -n 1 -s
+    return 0
 }
 
 # 函数: 显示 VPN 实时状态
